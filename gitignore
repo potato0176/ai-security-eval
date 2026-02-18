@@ -34,3 +34,12 @@ Thumbs.db
 
 # Garak
 garak_runs/
+
+# 安全：絕對不要上傳密鑰
+.env
+
+# 系統：不要上傳虛擬環境
+.venv/
+venv/
+__pycache__/
+*.pyc
