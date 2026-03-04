@@ -7,6 +7,10 @@ Endpoints:
   POST /admin/evaluate - 觸發 DeepEval 評測
   GET  /health         - 健康檢查
   GET  /metrics        - 安全指標摘要
+
+修復紀錄：
+  - Langfuse 3.x 相容：langfuse.trace() → langfuse_sdk.trace()
+  - 完整 try/except fallback，無 Langfuse key 也能正常運作
 """
 
 import os
@@ -22,7 +26,6 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
-from langfuse import Langfuse
 
 # Internal imports
 import sys
@@ -34,14 +37,63 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# Langfuse Setup
+# Langfuse Setup（Langfuse 3.x 相容版）
 # ─────────────────────────────────────────────
 
-langfuse = Langfuse(
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test"),
-    secret_key=os.getenv("LANGFUSE_SECRET_KEY", "sk-lf-test"),
-    host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
-)
+LANGFUSE_ENABLED = False
+langfuse_sdk = None
+
+try:
+    from langfuse import Langfuse
+    _lf = Langfuse(
+        public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
+        secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
+        host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    )
+    # 測試 Langfuse 3.x 是否支援 trace()
+    if hasattr(_lf, "trace"):
+        langfuse_sdk = _lf
+        LANGFUSE_ENABLED = True
+        logger.info("✅ Langfuse connected (trace mode)")
+    else:
+        logger.warning("⚠️  Langfuse loaded but trace() not available — running without tracing")
+except Exception as e:
+    logger.warning(f"⚠️  Langfuse not available: {e} — running without tracing")
+
+
+# ── Trace/Span no-op fallback（無 Langfuse 時使用）─────────────
+class _NoOpSpan:
+    """當 Langfuse 不可用時的空白 Span，避免 AttributeError"""
+    id = None
+    def end(self, **kwargs): pass
+    def update(self, **kwargs): pass
+    def span(self, **kwargs): return _NoOpSpan()
+
+class _NoOpTrace(_NoOpSpan):
+    id = None
+
+def _create_trace(name, session_id, user_id, query):
+    """安全建立 Langfuse trace，失敗時回傳 no-op"""
+    if LANGFUSE_ENABLED and langfuse_sdk:
+        try:
+            return langfuse_sdk.trace(
+                name=name,
+                session_id=session_id,
+                user_id=user_id,
+                input={"query": query},
+                tags=["production", "rag", "security-middleware"]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create Langfuse trace: {e}")
+    return _NoOpTrace()
+
+def _flush_langfuse():
+    if LANGFUSE_ENABLED and langfuse_sdk:
+        try:
+            langfuse_sdk.flush()
+        except Exception:
+            pass
+
 
 # ─────────────────────────────────────────────
 # Request/Response Models
@@ -59,7 +111,7 @@ class QueryResponse(BaseModel):
     query: str
     response: str
     blocked: bool
-    block_reason: Optional[str]
+    block_reason: Optional[str] = None
     security_summary: dict
     session_id: str
     trace_id: Optional[str] = None
@@ -71,8 +123,9 @@ class EvaluationRequest(BaseModel):
     dataset_size: int = 4
 
 
-# In-memory metrics store (use Redis in production)
+# In-memory metrics（生產環境建議換 Redis）
 security_metrics = defaultdict(int)
+
 
 # ─────────────────────────────────────────────
 # App Setup
@@ -80,9 +133,10 @@ security_metrics = defaultdict(int)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("AI Security Middleware API starting up...")
+    logger.info("🚀 AI Security Middleware API starting up...")
+    logger.info(f"   Langfuse tracing: {'enabled' if LANGFUSE_ENABLED else 'disabled (fallback mode)'}")
     yield
-    langfuse.flush()
+    _flush_langfuse()
     logger.info("Shutdown complete.")
 
 
@@ -110,7 +164,7 @@ async def log_requests(request: Request, call_next):
     start_time = datetime.utcnow()
     response = await call_next(request)
     duration = (datetime.utcnow() - start_time).total_seconds()
-    logger.info(f"{request.method} {request.url.path} - {response.status_code} ({duration:.3f}s)")
+    logger.info(f"{request.method} {request.url.path} → {response.status_code} ({duration:.3f}s)")
     return response
 
 
@@ -126,7 +180,7 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "version": "1.0.0",
         "services": {
-            "langfuse": "connected",
+            "langfuse": "connected" if LANGFUSE_ENABLED else "disabled (no key)",
             "middleware": "active"
         }
     }
@@ -136,28 +190,30 @@ async def health_check():
 async def secure_query(request: QueryRequest):
     """
     Main endpoint: RAG query with security middleware applied.
-    
+
     Flow:
     1. Receive user query
     2. Run RAG retrieval + generation
     3. Apply security middleware (PII masking + injection detection)
-    4. Log everything to Langfuse
+    4. Log to Langfuse（若有設定）
     5. Return filtered response
     """
     session_id = request.session_id or str(uuid.uuid4())
-    
-    # Create Langfuse trace for this request
-    trace = langfuse.trace(
+    trace_id = str(uuid.uuid4())  # 預設 trace_id（無 Langfuse 時使用）
+
+    # 建立 Langfuse trace（失敗時回傳 no-op，不影響主流程）
+    trace = _create_trace(
         name="secure_rag_query",
         session_id=session_id,
-        user_id=request.user_id,
-        input={"query": request.query},
-        tags=["production", "rag", "security-middleware"]
+        user_id=request.user_id or "anonymous",
+        query=request.query
     )
+    if trace.id:
+        trace_id = trace.id
 
     try:
         # Step 1: RAG Query
-        rag_span = trace.span(name="rag_retrieval_and_generation")
+        rag_span = trace.span(name="rag_retrieval_and_generation") if hasattr(trace, 'span') else _NoOpSpan()
         rag_result = rag_query(request.query, session_id)
         rag_span.end(
             output={"response_length": len(rag_result["response"])},
@@ -165,7 +221,7 @@ async def secure_query(request: QueryRequest):
         )
 
         # Step 2: Security Middleware
-        security_span = trace.span(name="security_middleware")
+        security_span = trace.span(name="security_middleware") if hasattr(trace, 'span') else _NoOpSpan()
         security_result = process_response(
             response_text=rag_result["response"],
             query=request.query,
@@ -190,7 +246,7 @@ async def secure_query(request: QueryRequest):
         if security_result.pii_detected:
             security_metrics["pii_masked"] += len(security_result.pii_detected)
 
-        # Step 4: Complete Langfuse trace
+        # Step 4: Update Langfuse trace
         trace.update(
             output={"response": security_result.processed_text[:200]},
             metadata={
@@ -199,7 +255,7 @@ async def secure_query(request: QueryRequest):
                 "pii_types": [d["type"] for d in security_result.pii_detected],
             }
         )
-        langfuse.flush()
+        _flush_langfuse()
 
         return QueryResponse(
             query=request.query,
@@ -214,15 +270,15 @@ async def secure_query(request: QueryRequest):
                 "injection_patterns": [d["name"] for d in security_result.injection_details],
             },
             session_id=session_id,
-            trace_id=trace.id
+            trace_id=trace_id
         )
 
     except Exception as e:
-        trace.update(
-            metadata={"error": str(e)},
-            level="ERROR"
-        )
-        logger.error(f"Error processing query: {e}")
+        try:
+            trace.update(metadata={"error": str(e)})
+        except Exception:
+            pass
+        logger.error(f"Error processing query: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
@@ -272,7 +328,8 @@ async def root():
         "message": "AI Security & Quality Middleware API",
         "docs": "/docs",
         "health": "/health",
-        "endpoints": ["/query", "/admin/evaluate", "/metrics"]
+        "endpoints": ["/query", "/admin/evaluate", "/metrics"],
+        "langfuse_enabled": LANGFUSE_ENABLED
     }
 
 
