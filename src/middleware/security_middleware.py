@@ -102,10 +102,10 @@ PII_PATTERNS = {
 
 INJECTION_PATTERNS = [
     {
-        "name": "ignore_instructions",
-        "pattern": r"(?i)(ignore|forget|disregard|override)\s+(previous|all|your|the)\s+(instructions?|prompt|rules?|guidelines?|context)",
-        "risk": RiskLevel.CRITICAL,
-        "description": "Attempt to override system instructions"
+    "name": "ignore_instructions",
+    "pattern": r"(?i)(ignore|forget|disregard|override)\s+(all\s+)?(previous|your|the)?\s*(instructions?|prompt|rules?|guidelines?|context)",
+    "risk": RiskLevel.CRITICAL,
+    "description": "Attempt to override system instructions"
     },
     {
         "name": "role_jailbreak",
