@@ -45,3 +45,9 @@ __pycache__/
 *.pyc
 
 offline_packages/
+
+offline_packages/
+
+ai_security_packages.zip
+
+ai_security_packages.tar.gz
